@@ -4,7 +4,7 @@ import {
   WidgetType
 } from '@codemirror/view'
 import { RangeSetBuilder } from '@codemirror/state'
-import { parseMarkdownRegions } from './markdown-parser'
+import { parseMarkdownRegions, isRegionActive } from './markdown-parser'
 
 /**
  * HR Widget — renders a horizontal rule
@@ -148,42 +148,36 @@ const listMarkerDeco = Decoration.mark({ class: 'md-list-marker' })
 const headingMarkDeco = Decoration.mark({ class: 'md-heading-mark' })
 
 /**
- * Get the line range that the cursor is on.
- * Returns { from, to } of the current line(s) covered by all selections.
+ * Ignore parser output that does not describe a valid document span. This keeps
+ * malformed or future/unknown syntax from displacing later decorations.
  */
-function getCursorLineRanges(state) {
-  const ranges = []
-  for (const sel of state.selection.ranges) {
-    const lineFrom = state.doc.lineAt(sel.from)
-    const lineTo = state.doc.lineAt(sel.to)
-    ranges.push({ from: lineFrom.from, to: lineTo.to })
-  }
-  return ranges
-}
-
-/**
- * Check if a region overlaps with any cursor line range.
- */
-function isCursorOnRegion(region, cursorRanges) {
-  return cursorRanges.some(cr => region.from <= cr.to && region.to >= cr.from)
+function isValidRegion(region, docLength) {
+  return region &&
+    Number.isInteger(region.from) &&
+    Number.isInteger(region.to) &&
+    region.from >= 0 &&
+    region.to <= docLength &&
+    region.from < region.to
 }
 
 /**
  * Build decorations for the entire document.
- * Core logic: if cursor is on a region, show syntax marks; otherwise, hide them and show rendered result.
+ * Each region has one active/inactive result, shared by all of its decorations.
  */
 function buildDecorations(view) {
   const { state } = view
   const doc = state.doc.toString()
   const regions = parseMarkdownRegions(doc)
-  const cursorRanges = getCursorLineRanges(state)
+  const selectionRanges = state.selection.ranges
   const builder = new RangeSetBuilder()
 
   // We need to collect all decorations and sort them by from position
   const decos = []
 
   for (const region of regions) {
-    const cursorOn = isCursorOnRegion(region, cursorRanges)
+    if (!isValidRegion(region, doc.length)) continue
+
+    const cursorOn = isRegionActive(region, selectionRanges)
 
     switch (region.type) {
       case 'heading': {
@@ -341,14 +335,19 @@ function buildDecorations(view) {
           const line = state.doc.line(lineNum)
           decos.push({ from: line.from, to: line.from, deco: codeBlockDeco, isLine: true })
         }
-        // Hide fence markers when cursor is not on the block
+        // Hide complete fence lines in preview mode; unterminated blocks only have an opening fence.
         if (!cursorOn) {
-          const firstLine = state.doc.lineAt(region.from)
-          const lastLine = state.doc.lineAt(region.to)
-          // Hide opening fence
-          decos.push({ from: firstLine.from, to: firstLine.to, deco: syntaxHiddenDeco })
-          // Hide closing fence
-          decos.push({ from: lastLine.from, to: lastLine.to, deco: syntaxHiddenDeco })
+          const {
+            openingFrom,
+            openingTo,
+            closingFrom,
+            closingTo
+          } = region.meta
+
+          decos.push({ from: openingFrom, to: openingTo, deco: syntaxHiddenDeco })
+          if (closingFrom >= 0 && closingTo > closingFrom) {
+            decos.push({ from: closingFrom, to: closingTo, deco: syntaxHiddenDeco })
+          }
         }
         break
       }
@@ -386,7 +385,7 @@ export const markdownDecorationPlugin = ViewPlugin.fromClass(
     }
 
     update(update) {
-      if (update.docChanged || update.selectionSet || update.viewportChanged) {
+      if (update.docChanged || update.selectionSet) {
         this.decorations = buildDecorations(update.view)
       }
     }

@@ -31,6 +31,8 @@ export function parseMarkdownRegions(doc) {
   let codeBlockStart = -1
   let codeBlockLang = ''
   let codeBlockMarkerLen = 0
+  let codeBlockMarkerChar = ''
+  let codeBlockOpeningTo = -1
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
@@ -40,25 +42,42 @@ export function parseMarkdownRegions(doc) {
     // Code block fences
     const fenceMatch = line.match(/^(`{3,}|~{3,})(.*)$/)
     if (fenceMatch) {
+      const marker = fenceMatch[1]
+      const isClosingFence = inCodeBlock &&
+        marker[0] === codeBlockMarkerChar &&
+        marker.length >= codeBlockMarkerLen &&
+        fenceMatch[2].trim() === ''
+
       if (!inCodeBlock) {
         inCodeBlock = true
         codeBlockStart = lineStart
+        codeBlockOpeningTo = lineEnd
         codeBlockLang = fenceMatch[2].trim()
-        codeBlockMarkerLen = fenceMatch[1].length
+        codeBlockMarkerLen = marker.length
+        codeBlockMarkerChar = marker[0]
         pos = lineEnd + 1
         continue
-      } else if (fenceMatch[1].length >= codeBlockMarkerLen && fenceMatch[1][0] === (lines[findCodeBlockStartLine(lines, codeBlockStart, pos)]?.match(/^(`{3,}|~{3,})/)?.[1]?.[0] || '`')) {
+      } else if (isClosingFence) {
         regions.push({
           type: 'code-block',
           from: codeBlockStart,
           to: lineEnd,
           contentFrom: codeBlockStart,
           contentTo: lineEnd,
-          meta: { language: codeBlockLang }
+          meta: {
+            language: codeBlockLang,
+            openingFrom: codeBlockStart,
+            openingTo: codeBlockOpeningTo,
+            closingFrom: lineStart,
+            closingTo: lineEnd
+          }
         })
         inCodeBlock = false
         codeBlockStart = -1
+        codeBlockOpeningTo = -1
         codeBlockLang = ''
+        codeBlockMarkerLen = 0
+        codeBlockMarkerChar = ''
         pos = lineEnd + 1
         continue
       }
@@ -168,16 +187,25 @@ export function parseMarkdownRegions(doc) {
     pos = lineEnd + 1
   }
 
-  return regions
-}
-
-function findCodeBlockStartLine(lines, codeBlockStart, currentPos) {
-  let p = 0
-  for (let i = 0; i < lines.length; i++) {
-    if (p === codeBlockStart) return i
-    p += lines[i].length + 1
+  if (inCodeBlock) {
+    const end = Math.max(codeBlockStart, doc.length)
+    regions.push({
+      type: 'code-block',
+      from: codeBlockStart,
+      to: end,
+      contentFrom: codeBlockStart,
+      contentTo: end,
+      meta: {
+        language: codeBlockLang,
+        openingFrom: codeBlockStart,
+        openingTo: codeBlockOpeningTo,
+        closingFrom: -1,
+        closingTo: -1
+      }
+    })
   }
-  return 0
+
+  return regions
 }
 
 /**
@@ -270,6 +298,33 @@ function parseInlineRegions(line, lineStart, regions) {
 }
 
 /**
+ * Return true when any selection range actually touches a parsed region.
+ *
+ * Fold cursors are a point, so the boundaries of a syntax region are included.
+ * Non-empty selections use the same half-open interval rule as document changes.
+ * Every region is judged from this one predicate so inline and block decorations
+ * cannot diverge during multiple or cross-line selections.
+ * @param {MarkdownRegion} region
+ * @param {{from: number, to: number, empty?: boolean}[]} selectionRanges
+ * @returns {boolean}
+ */
+export function isRegionActive(region, selectionRanges) {
+  if (!region || !Array.isArray(selectionRanges)) return false
+
+  return selectionRanges.some(range => {
+    if (!range || typeof range.from !== 'number' || typeof range.to !== 'number') return false
+    const from = Math.min(range.from, range.to)
+    const to = Math.max(range.from, range.to)
+    const empty = typeof range.empty === 'boolean' ? range.empty : from === to
+
+    if (empty) {
+      return from >= region.from && from <= region.to
+    }
+    return from < region.to && to > region.from
+  })
+}
+
+/**
  * Check if a position falls within any region.
  * @param {MarkdownRegion[]} regions
  * @param {number} pos
@@ -280,12 +335,12 @@ export function regionAtPos(regions, pos) {
 }
 
 /**
- * Check if a cursor line overlaps with a region.
+ * Backwards-compatible wrapper for the single-selection API.
  * @param {MarkdownRegion} region
- * @param {number} lineFrom
- * @param {number} lineTo
+ * @param {number} from
+ * @param {number} [to]
  * @returns {boolean}
  */
-export function cursorOnRegion(region, lineFrom, lineTo) {
-  return region.from <= lineTo && region.to >= lineFrom
+export function cursorOnRegion(region, from, to = from) {
+  return isRegionActive(region, [{ from, to, empty: from === to }])
 }
