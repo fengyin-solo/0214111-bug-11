@@ -4,7 +4,7 @@ import {
   WidgetType
 } from '@codemirror/view'
 import { RangeSetBuilder } from '@codemirror/state'
-import { parseMarkdownRegions } from './markdown-parser'
+import { parseMarkdownRegions, getActiveLineRanges, isRegionActive } from './markdown-parser'
 
 /**
  * HR Widget — renders a horizontal rule
@@ -148,42 +148,24 @@ const listMarkerDeco = Decoration.mark({ class: 'md-list-marker' })
 const headingMarkDeco = Decoration.mark({ class: 'md-heading-mark' })
 
 /**
- * Get the line range that the cursor is on.
- * Returns { from, to } of the current line(s) covered by all selections.
- */
-function getCursorLineRanges(state) {
-  const ranges = []
-  for (const sel of state.selection.ranges) {
-    const lineFrom = state.doc.lineAt(sel.from)
-    const lineTo = state.doc.lineAt(sel.to)
-    ranges.push({ from: lineFrom.from, to: lineTo.to })
-  }
-  return ranges
-}
-
-/**
- * Check if a region overlaps with any cursor line range.
- */
-function isCursorOnRegion(region, cursorRanges) {
-  return cursorRanges.some(cr => region.from <= cr.to && region.to >= cr.from)
-}
-
-/**
  * Build decorations for the entire document.
  * Core logic: if cursor is on a region, show syntax marks; otherwise, hide them and show rendered result.
+ *
+ * 每个区域的编辑/渲染态只由 parser 的 isRegionActive 判定一次，
+ * 本函数内任何分支都直接复用该结果，不再另作光标判定。
  */
 function buildDecorations(view) {
   const { state } = view
   const doc = state.doc.toString()
   const regions = parseMarkdownRegions(doc)
-  const cursorRanges = getCursorLineRanges(state)
+  const activeRanges = getActiveLineRanges(state.selection.ranges, (pos) => state.doc.lineAt(pos))
   const builder = new RangeSetBuilder()
 
   // We need to collect all decorations and sort them by from position
   const decos = []
 
   for (const region of regions) {
-    const cursorOn = isCursorOnRegion(region, cursorRanges)
+    const cursorOn = isRegionActive(region, activeRanges)
 
     switch (region.type) {
       case 'heading': {
@@ -341,27 +323,32 @@ function buildDecorations(view) {
           const line = state.doc.line(lineNum)
           decos.push({ from: line.from, to: line.from, deco: codeBlockDeco, isLine: true })
         }
-        // Hide fence markers when cursor is not on the block
+        // Hide fence markers when cursor is not on the block.
+        // fences 由解析器记录：已闭合块包含开/闭两行；EOF 处未闭合的块只包含开启行，
+        // 此时开启围栏是正在编辑的未知结构，保持可见而不是隐藏。
         if (!cursorOn) {
-          const firstLine = state.doc.lineAt(region.from)
-          const lastLine = state.doc.lineAt(region.to)
-          // Hide opening fence
-          decos.push({ from: firstLine.from, to: firstLine.to, deco: syntaxHiddenDeco })
-          // Hide closing fence
-          decos.push({ from: lastLine.from, to: lastLine.to, deco: syntaxHiddenDeco })
+          const fences = region.meta.fences || []
+          const closable = fences.length >= 2
+          if (closable) {
+            for (const fenceFrom of fences) {
+              const fenceLine = state.doc.lineAt(fenceFrom)
+              decos.push({ from: fenceLine.from, to: fenceLine.to, deco: syntaxHiddenDeco })
+            }
+          }
         }
         break
       }
     }
   }
 
-  // Sort decorations by from position, then by whether they are line decorations
+  // RangeSetBuilder 要求按 (from, value.startSide) 升序添加。
+  // 使用 startSide 本身而不是装饰类型，保证与 CodeMirror 内部排序
+  // （cmpRange: from 相同则按 startSide）完全一致：
+  //   line 装饰（Side.Line, -2e8）→ replace widget（约 -2）→ 非包含 mark（约 5e8）
+  // 稳定排序保留同起点、同侧装饰的生成顺序，避免标记范围错位/串层。
   decos.sort((a, b) => {
     if (a.from !== b.from) return a.from - b.from
-    // Line decorations should come before mark decorations at the same position
-    if (a.isLine && !b.isLine) return -1
-    if (!a.isLine && b.isLine) return 1
-    return 0
+    return (a.deco.startSide ?? 0) - (b.deco.startSide ?? 0)
   })
 
   // Filter out invalid ranges (from >= to for non-line decorations)
